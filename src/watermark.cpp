@@ -2,6 +2,7 @@
 
 #include <d3dcompiler.h>
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 #pragma comment(lib, "d3dcompiler.lib")
@@ -118,7 +119,8 @@ namespace
         // SetAlternatePolarity.
         float polarity;
         // x, y: size of one texel in UV units. z: radius of the activity taps
-        // in texels. w: unused.
+        // in texels. w: 1 when the destination view is sRGB and the shader
+        // must hand back linear values for the hardware to re-encode, else 0.
         float texel[4];
         // Perceptual weighting: knee, floor, texture threshold low, high.
         // See kMask* below.
@@ -184,6 +186,12 @@ VSOut main(uint id : SV_VertexID)
     // no edges between cells for the eye to pick out. The bump is scaled by
     // the perceptual weight described above and clamped so no channel
     // leaves its range.
+    //
+    // The scene is always read through a non-sRGB view, so every value here
+    // is an encoded display code in 0..1, which is what the perceptual model
+    // and the decoder assume. When the destination view is sRGB the hardware
+    // would encode the result a second time, so the shader decodes it first;
+    // encode(decode(x)) returns x exactly for every 8-bit code.
     const char* kPixelShaderSource = R"(
 Texture2D    sceneTexture : register(t0);
 SamplerState sceneSampler : register(s0);
@@ -231,6 +239,16 @@ float Activity(float2 uv, float2 r)
     return total / 8.0;
 }
 
+// The exact sRGB transfer curve, not a gamma approximation: the hardware
+// encoder is specified against this curve, and only the exact inverse
+// round-trips every 8-bit code.
+float3 SrgbToLinear(float3 c)
+{
+    float3 low = c / 12.92;
+    float3 high = pow((c + 0.055) / 1.055, 2.4);
+    return (c <= 0.04045) ? low : high;
+}
+
 float4 main(PSIn input) : SV_TARGET
 {
     float3 scene = sceneTexture.Sample(sceneSampler, input.uv).rgb;
@@ -248,16 +266,34 @@ float4 main(PSIn input) : SV_TARGET
     // Texture measure: local activity, eroded over a 3x3 of positions at
     // twice the tap radius, so a single edge with flat colour beside it
     // scores as flat.
-    float2 r = texel.xy * texel.z;
-    float eroded = 1e9;
-    [unroll] for (int dy = -1; dy <= 1; ++dy)
+    //
+    // Two early-outs skip the activity reads where they cannot change the
+    // result. A pixel too dark to carry anything has weight 0 whatever its
+    // texture. And the erosion is a minimum, so once the centre position is
+    // already at or below the lower threshold the smoothstep is exactly 0
+    // no matter what the other eight positions read. Neither changes the
+    // value at any pixel; on a frame of flat panels they remove most of the
+    // 82 texture reads.
+    float lumaWeight = saturate(dot(scene, kLumaWeights) / maskParams.x);
+    float weight = 0.0;
+    [branch] if (lumaWeight > 0.0)
     {
-        [unroll] for (int dx = -1; dx <= 1; ++dx)
-            eroded = min(eroded, Activity(input.uv + float2(dx, dy) * 2.0 * r, r));
+        float2 r = texel.xy * texel.z;
+        float eroded = Activity(input.uv, r);
+        [branch] if (eroded > maskParams.z)
+        {
+            [unroll] for (int dy = -1; dy <= 1; ++dy)
+            {
+                [unroll] for (int dx = -1; dx <= 1; ++dx)
+                {
+                    if (dx != 0 || dy != 0)
+                        eroded = min(eroded, Activity(input.uv + float2(dx, dy) * 2.0 * r, r));
+                }
+            }
+        }
+        float textureMask = smoothstep(maskParams.z, maskParams.w, eroded);
+        weight = lumaWeight * (maskParams.y + (1.0 - maskParams.y) * textureMask);
     }
-    float textureMask = smoothstep(maskParams.z, maskParams.w, eroded);
-    float weight = saturate(dot(scene, kLumaWeights) / maskParams.x)
-                 * (maskParams.y + (1.0 - maskParams.y) * textureMask);
 
     float3 offset = kChromaAxis * (amplitude * strength * profile * weight * polarity);
 
@@ -266,7 +302,10 @@ float4 main(PSIn input) : SV_TARGET
                                  : ((offset < 0.0) ? scene / max(-offset, 1e-6) : 1e6);
     float scale = saturate(min(room.r, min(room.g, room.b)));
 
-    return float4(saturate(scene + offset * scale), 1.0);
+    float3 marked = saturate(scene + offset * scale);
+    if (texel.w > 0.5)
+        marked = SrgbToLinear(marked);
+    return float4(marked, 1.0);
 }
 )";
 
@@ -280,7 +319,152 @@ float4 main(PSIn input) : SV_TARGET
             errors->Release();
         return SUCCEEDED(hr);
     }
+
+    template <typename T>
+    void SafeRelease(T*& object)
+    {
+        if (object)
+        {
+            object->Release();
+            object = nullptr;
+        }
+    }
+
+    // ---- Format handling -------------------------------------------------
+
+    bool IsSrgbFormat(DXGI_FORMAT format)
+    {
+        return format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    }
+
+    // The UNORM view format that reads the same bits without a transfer
+    // curve; the format itself for anything that has no sRGB twin.
+    DXGI_FORMAT NonSrgbTwin(DXGI_FORMAT format)
+    {
+        switch (format)
+        {
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM;
+        default: return format;
+        }
+    }
+
+    // The typeless resource format the views are cast from, or UNKNOWN when
+    // the format has no sRGB twin and the texture can simply be typed.
+    DXGI_FORMAT TypelessFamily(DXGI_FORMAT format)
+    {
+        switch (format)
+        {
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+        default: return DXGI_FORMAT_UNKNOWN;
+        }
+    }
+
+    bool IsSupportedFormat(DXGI_FORMAT format)
+    {
+        switch (format)
+        {
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        case DXGI_FORMAT_R10G10B10A2_UNORM:
+            return true;
+        default:
+            return false;
+        }
+    }
 }
+
+// ---- Pipeline state save and restore ---------------------------------------
+
+void FrameWatermark::SavedPipelineState::Capture(ID3D11DeviceContext* context)
+{
+    memset(this, 0, sizeof(*this));
+
+    context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, renderTargets, &depthStencil);
+    viewportCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    context->RSGetViewports(&viewportCount, viewports);
+    context->RSGetState(&rasteriser);
+    context->OMGetDepthStencilState(&depthStencilState, &stencilRef);
+    context->OMGetBlendState(&blendState, blendFactor, &sampleMask);
+    context->IAGetInputLayout(&inputLayout);
+    context->IAGetPrimitiveTopology(&topology);
+
+    vertexInstanceCount = kMaxClassInstances;
+    context->VSGetShader(&vertexShader, vertexInstances, &vertexInstanceCount);
+    pixelInstanceCount = kMaxClassInstances;
+    context->PSGetShader(&pixelShader, pixelInstances, &pixelInstanceCount);
+    geometryInstanceCount = kMaxClassInstances;
+    context->GSGetShader(&geometryShader, geometryInstances, &geometryInstanceCount);
+    hullInstanceCount = kMaxClassInstances;
+    context->HSGetShader(&hullShader, hullInstances, &hullInstanceCount);
+    domainInstanceCount = kMaxClassInstances;
+    context->DSGetShader(&domainShader, domainInstances, &domainInstanceCount);
+
+    context->PSGetShaderResources(0, kSavedShaderResources, shaderResources);
+    context->PSGetSamplers(0, 1, &sampler);
+    context->PSGetConstantBuffers(0, 1, &constantBuffer);
+}
+
+void FrameWatermark::SavedPipelineState::Restore(ID3D11DeviceContext* context,
+                                                 ID3D11ShaderResourceView* const* ownedViews, UINT ownedCount)
+{
+    // Targets first: the caller has already unbound the watermark's own
+    // views, so putting the previous targets back cannot trip a hazard.
+    context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, renderTargets, depthStencil);
+    context->RSSetViewports(viewportCount, viewports);
+    context->RSSetState(rasteriser);
+    context->OMSetDepthStencilState(depthStencilState, stencilRef);
+    context->OMSetBlendState(blendState, blendFactor, sampleMask);
+    context->IASetInputLayout(inputLayout);
+    context->IASetPrimitiveTopology(topology);
+
+    context->VSSetShader(vertexShader, vertexInstances, vertexInstanceCount);
+    context->PSSetShader(pixelShader, pixelInstances, pixelInstanceCount);
+    context->GSSetShader(geometryShader, geometryInstances, geometryInstanceCount);
+    context->HSSetShader(hullShader, hullInstances, hullInstanceCount);
+    context->DSSetShader(domainShader, domainInstances, domainInstanceCount);
+
+    ID3D11ShaderResourceView* restoredViews[kSavedShaderResources];
+    for (UINT slot = 0; slot < kSavedShaderResources; ++slot)
+    {
+        restoredViews[slot] = shaderResources[slot];
+        for (UINT owned = 0; owned < ownedCount; ++owned)
+            if (restoredViews[slot] && restoredViews[slot] == ownedViews[owned])
+                restoredViews[slot] = nullptr;
+    }
+    context->PSSetShaderResources(0, kSavedShaderResources, restoredViews);
+    context->PSSetSamplers(0, 1, &sampler);
+    context->PSSetConstantBuffers(0, 1, &constantBuffer);
+
+    for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
+        SafeRelease(renderTargets[i]);
+    SafeRelease(depthStencil);
+    SafeRelease(rasteriser);
+    SafeRelease(depthStencilState);
+    SafeRelease(blendState);
+    SafeRelease(inputLayout);
+    SafeRelease(vertexShader);
+    SafeRelease(pixelShader);
+    SafeRelease(geometryShader);
+    SafeRelease(hullShader);
+    SafeRelease(domainShader);
+    for (UINT i = 0; i < vertexInstanceCount; ++i) SafeRelease(vertexInstances[i]);
+    for (UINT i = 0; i < pixelInstanceCount; ++i) SafeRelease(pixelInstances[i]);
+    for (UINT i = 0; i < geometryInstanceCount; ++i) SafeRelease(geometryInstances[i]);
+    for (UINT i = 0; i < hullInstanceCount; ++i) SafeRelease(hullInstances[i]);
+    for (UINT i = 0; i < domainInstanceCount; ++i) SafeRelease(domainInstances[i]);
+    for (UINT i = 0; i < kSavedShaderResources; ++i)
+        SafeRelease(shaderResources[i]);
+    SafeRelease(sampler);
+    SafeRelease(constantBuffer);
+}
+
+// ---- Setup -------------------------------------------------------------------
 
 bool FrameWatermark::Initialise(ID3D11Device* device, ID3D11DeviceContext* context)
 {
@@ -341,38 +525,153 @@ bool FrameWatermark::Initialise(ID3D11Device* device, ID3D11DeviceContext* conte
     if (FAILED(m_device->CreateDepthStencilState(&depthDesc, &m_depthStencilState)))
         return false;
 
+    // Timing is a convenience, not a requirement: a device that cannot
+    // create the queries still watermarks, it just never reports a time.
+    if (!CreateTimingQueries())
+        ReleaseTimingQueries();
+
     return true;
 }
 
-bool FrameWatermark::ResizeBuffers(UINT width, UINT height)
+bool FrameWatermark::ResizeBuffers(UINT width, UINT height, DXGI_FORMAT format)
 {
-    if (width == 0 || height == 0)
+    if (width == 0 || height == 0 || !IsSupportedFormat(format))
         return false;
 
-    if (m_sceneSRV) { m_sceneSRV->Release(); m_sceneSRV = nullptr; }
-    if (m_sceneRTV) { m_sceneRTV->Release(); m_sceneRTV = nullptr; }
-    if (m_sceneTexture) { m_sceneTexture->Release(); m_sceneTexture = nullptr; }
+    SafeRelease(m_sceneSRV);
+    SafeRelease(m_sceneRTV);
+    SafeRelease(m_sceneTexture);
+    m_format = DXGI_FORMAT_UNKNOWN;
+
+    const DXGI_FORMAT typeless = TypelessFamily(format);
+    const DXGI_FORMAT viewFormat = NonSrgbTwin(format);
+
+    UINT support = 0;
+    if (FAILED(m_device->CheckFormatSupport(format, &support))
+        || !(support & D3D11_FORMAT_SUPPORT_RENDER_TARGET))
+        return false;
+    if (FAILED(m_device->CheckFormatSupport(viewFormat, &support))
+        || !(support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE))
+        return false;
 
     D3D11_TEXTURE2D_DESC textureDesc = {};
     textureDesc.Width = width;
     textureDesc.Height = height;
     textureDesc.MipLevels = 1;
     textureDesc.ArraySize = 1;
-    textureDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    textureDesc.Format = typeless != DXGI_FORMAT_UNKNOWN ? typeless : format;
     textureDesc.SampleDesc.Count = 1;
     textureDesc.Usage = D3D11_USAGE_DEFAULT;
     textureDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
     if (FAILED(m_device->CreateTexture2D(&textureDesc, nullptr, &m_sceneTexture)))
         return false;
-    if (FAILED(m_device->CreateRenderTargetView(m_sceneTexture, nullptr, &m_sceneRTV)))
-        return false;
-    if (FAILED(m_device->CreateShaderResourceView(m_sceneTexture, nullptr, &m_sceneSRV)))
-        return false;
+
+    if (typeless != DXGI_FORMAT_UNKNOWN)
+    {
+        // Views over a typeless resource must name their format. The render
+        // target view carries the caller's format, sRGB or not, so drawing
+        // into the intermediate behaves exactly as drawing into the swap
+        // chain would; the shader resource view is always the plain UNORM
+        // twin so the pass reads encoded display codes.
+        D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+        rtvDesc.Format = format;
+        rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        rtvDesc.Texture2D.MipSlice = 0;
+        if (FAILED(m_device->CreateRenderTargetView(m_sceneTexture, &rtvDesc, &m_sceneRTV)))
+            return false;
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format = viewFormat;
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MostDetailedMip = 0;
+        srvDesc.Texture2D.MipLevels = 1;
+        if (FAILED(m_device->CreateShaderResourceView(m_sceneTexture, &srvDesc, &m_sceneSRV)))
+            return false;
+    }
+    else
+    {
+        if (FAILED(m_device->CreateRenderTargetView(m_sceneTexture, nullptr, &m_sceneRTV)))
+            return false;
+        if (FAILED(m_device->CreateShaderResourceView(m_sceneTexture, nullptr, &m_sceneSRV)))
+            return false;
+    }
 
     m_width = width;
     m_height = height;
+    m_format = format;
     return true;
 }
+
+// ---- Timing ------------------------------------------------------------------
+
+bool FrameWatermark::CreateTimingQueries()
+{
+    D3D11_QUERY_DESC disjointDesc = {};
+    disjointDesc.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+    D3D11_QUERY_DESC timestampDesc = {};
+    timestampDesc.Query = D3D11_QUERY_TIMESTAMP;
+
+    for (TimingSet& set : m_timing)
+    {
+        if (FAILED(m_device->CreateQuery(&disjointDesc, &set.disjoint)))
+            return false;
+        if (FAILED(m_device->CreateQuery(&timestampDesc, &set.begin)))
+            return false;
+        if (FAILED(m_device->CreateQuery(&timestampDesc, &set.end)))
+            return false;
+        set.pending = false;
+    }
+    m_timingNext = 0;
+    return true;
+}
+
+void FrameWatermark::ReleaseTimingQueries()
+{
+    for (TimingSet& set : m_timing)
+    {
+        SafeRelease(set.disjoint);
+        SafeRelease(set.begin);
+        SafeRelease(set.end);
+        set.pending = false;
+    }
+    m_lastPassMs = -1.0f;
+}
+
+// Collects every resolved set, oldest first, and keeps the newest of them.
+// Never waits: a set that has not resolved yet stops the walk, and the
+// following sets cannot have resolved either.
+void FrameWatermark::ReadTimingQueries()
+{
+    for (int step = 0; step < kTimingSets; ++step)
+    {
+        TimingSet& set = m_timing[(m_timingNext + step) % kTimingSets];
+        if (!set.pending)
+            continue;
+
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint = {};
+        const HRESULT hr = m_context->GetData(set.disjoint, &disjoint, sizeof(disjoint),
+                                              D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (hr == S_FALSE)
+            break;
+        set.pending = false;
+        if (FAILED(hr))
+            continue;
+
+        // Both timestamps were issued before the disjoint query ended, so
+        // they have resolved with it.
+        UINT64 begin = 0, end = 0;
+        if (m_context->GetData(set.begin, &begin, sizeof(begin), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK
+            || m_context->GetData(set.end, &end, sizeof(end), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+            continue;
+
+        // A disjoint interval means the clock changed mid-measurement and the
+        // numbers are meaningless; the previous value stands.
+        if (!disjoint.Disjoint && disjoint.Frequency != 0 && end >= begin)
+            m_lastPassMs = (float)((double)(end - begin) * 1000.0 / (double)disjoint.Frequency);
+    }
+}
+
+// ---- Per-frame -----------------------------------------------------------------
 
 void FrameWatermark::SetPayload(uint32_t payload)
 {
@@ -398,7 +697,7 @@ float FrameWatermark::CurrentPolarity() const
     return (halfPeriods & 1) ? -1.0f : 1.0f;
 }
 
-void FrameWatermark::UpdatePatternBuffer()
+void FrameWatermark::UpdatePatternBuffer(bool linearOutput)
 {
     WatermarkConstants constants = {};
     constants.strength = m_strength;
@@ -410,6 +709,7 @@ void FrameWatermark::UpdatePatternBuffer()
     const float cellPx = (float)(m_width < m_height ? m_width : m_height) / (float)WatermarkLayout::GridCols;
     float radius = floorf(kMaskRadiusCells * cellPx + 0.5f);
     constants.texel[2] = radius < 1.0f ? 1.0f : radius;
+    constants.texel[3] = linearOutput ? 1.0f : 0.0f;
     constants.maskParams[0] = kMaskKnee;
     constants.maskParams[1] = kMaskFloor;
     constants.maskParams[2] = kMaskTextureLow;
@@ -453,11 +753,42 @@ void FrameWatermark::Apply(ID3D11RenderTargetView* destination)
     if (!m_sceneSRV || !destination)
         return;
 
+    // The destination decides whether the shader must hand back linear
+    // values. The check is a CPU-side struct read; done every frame so a
+    // caller that swaps views between frames is handled.
+    D3D11_RENDER_TARGET_VIEW_DESC destinationDesc = {};
+    destination->GetDesc(&destinationDesc);
+    const bool linearOutput = IsSrgbFormat(destinationDesc.Format);
+    if (!m_warnedFormatMismatch && NonSrgbTwin(destinationDesc.Format) != NonSrgbTwin(m_format))
+    {
+        // Not fatal: the pass still draws, but precision or channel order
+        // may differ from what the intermediate was created for.
+        char message[160];
+        snprintf(message, sizeof(message),
+                 "FrameWatermark: destination format %d differs from the ResizeBuffers format %d\n",
+                 (int)destinationDesc.Format, (int)m_format);
+        OutputDebugStringA(message);
+        m_warnedFormatMismatch = true;
+    }
+
     // The strength and polarity are uploaded every frame so the ImGui
     // controls take effect immediately; the pattern itself only changes when
     // the payload does.
-    UpdatePatternBuffer();
+    UpdatePatternBuffer(linearOutput);
     m_patternDirty = false;
+
+    if (m_restoreState)
+        m_saved.Capture(m_context);
+
+    // Time the draw alone, on a set that is free; if the ring is full this
+    // frame simply goes unmeasured.
+    TimingSet& timing = m_timing[m_timingNext];
+    const bool measure = timing.disjoint != nullptr && !timing.pending;
+    if (measure)
+    {
+        m_context->Begin(timing.disjoint);
+        m_context->End(timing.begin);
+    }
 
     D3D11_VIEWPORT viewport = {};
     viewport.Width = (float)m_width;
@@ -485,22 +816,41 @@ void FrameWatermark::Apply(ID3D11RenderTargetView* destination)
 
     m_context->Draw(3, 0);
 
+    if (measure)
+    {
+        m_context->End(timing.end);
+        m_context->End(timing.disjoint);
+        timing.pending = true;
+        m_timingNext = (m_timingNext + 1) % kTimingSets;
+    }
+
     // Unbind the scene texture so it can be used as a render target again on
-    // the next frame.
-    ID3D11ShaderResourceView* const nullSRV[1] = { nullptr };
-    m_context->PSSetShaderResources(0, 1, nullSRV);
+    // the next frame. This happens before the previous targets go back, so
+    // the restore cannot trip the render-target / shader-resource hazard.
+    ID3D11ShaderResourceView* const nullViews[SavedPipelineState::kSavedShaderResources] = { nullptr, nullptr };
+    m_context->PSSetShaderResources(0, SavedPipelineState::kSavedShaderResources, nullViews);
+
+    if (m_restoreState)
+    {
+        ID3D11ShaderResourceView* const owned[1] = { m_sceneSRV };
+        m_saved.Restore(m_context, owned, 1);
+    }
+
+    ReadTimingQueries();
 }
 
 void FrameWatermark::Release()
 {
-    if (m_depthStencilState) { m_depthStencilState->Release(); m_depthStencilState = nullptr; }
-    if (m_rasteriser) { m_rasteriser->Release(); m_rasteriser = nullptr; }
-    if (m_blendState) { m_blendState->Release(); m_blendState = nullptr; }
-    if (m_sampler) { m_sampler->Release(); m_sampler = nullptr; }
-    if (m_constantBuffer) { m_constantBuffer->Release(); m_constantBuffer = nullptr; }
-    if (m_pixelShader) { m_pixelShader->Release(); m_pixelShader = nullptr; }
-    if (m_vertexShader) { m_vertexShader->Release(); m_vertexShader = nullptr; }
-    if (m_sceneSRV) { m_sceneSRV->Release(); m_sceneSRV = nullptr; }
-    if (m_sceneRTV) { m_sceneRTV->Release(); m_sceneRTV = nullptr; }
-    if (m_sceneTexture) { m_sceneTexture->Release(); m_sceneTexture = nullptr; }
+    ReleaseTimingQueries();
+    SafeRelease(m_depthStencilState);
+    SafeRelease(m_rasteriser);
+    SafeRelease(m_blendState);
+    SafeRelease(m_sampler);
+    SafeRelease(m_constantBuffer);
+    SafeRelease(m_pixelShader);
+    SafeRelease(m_vertexShader);
+    SafeRelease(m_sceneSRV);
+    SafeRelease(m_sceneRTV);
+    SafeRelease(m_sceneTexture);
+    m_format = DXGI_FORMAT_UNKNOWN;
 }

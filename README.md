@@ -191,9 +191,11 @@ swapchain->Present(1, 0);
 Against the stock ImGui example that is about twenty lines in `main.cpp`, plus
 four in the project file. No upstream ImGui source is modified.
 
-Full details, including pipeline-state caveats, the `R8G8B8A8_UNORM`
-assumption, why the pass must be last and must run at native resolution, and
-how to verify a port — see **[docs/INTEGRATION.md](docs/INTEGRATION.md)**.
+Full details, including how the pass saves and restores pipeline state, which
+swap-chain formats it takes and how sRGB is handled, what it costs (measured:
+0.02 ms at 1280×800, 0.05 ms at 1440p on an RTX 5090), why it must be last
+and must run at native resolution, and how to verify a port — see
+**[docs/INTEGRATION.md](docs/INTEGRATION.md)**.
 
 ---
 
@@ -346,8 +348,13 @@ The application has a capture hook the GPU suites drive:
 example_win32_directx11.exe --capture out.ppm 1234567 0.08
 ```
 
-It renders eight frames, writes the backbuffer as a binary PPM and exits. Pass
-`random` in place of the ID to have it draw one and print it.
+It renders eight frames, writes the backbuffer as a binary PPM and exits, along
+with the unmarked frame as `out.ppm.scene.ppm`, a line saying whether the pass
+handed the pipeline state back untouched, and the pass's GPU time. Pass
+`random` in place of the ID to have it draw one and print it. Three switches
+exist for testing and measuring, with or without `--capture`:
+`--format rgba8|bgra8|rgb10|srgb` picks the swap-chain format, `--size <w> <h>`
+the client area, and `--novsync` presents without waiting for the display.
 
 Unmarked images are rejected reliably: an unmarked photo, the same blurred,
 random blobs, a gradient, a checkerboard and six further wallpapers all score

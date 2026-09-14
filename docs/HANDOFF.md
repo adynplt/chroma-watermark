@@ -176,7 +176,10 @@ stay bit-identical: `HashU32`/`hash_u32`, `Crc8`/`crc8`,
 `DescribeCell`/`describe_cell`, `CellPositionTable`/`_build_position_table`.
 The numpy `embed()` in `test_roundtrip.py` mirrors the shader (profile,
 chroma axis, perceptual weight via the decoder's own `perceptual_weight()`,
-polarity, clamping) and must be kept in step with it. The shader was checked
+polarity, clamping) and must be kept in step with it. The shader skips the
+activity reads on pixels whose luma weight is 0 or whose centre activity is
+already at or below the lower texture threshold; both are exact shortcuts,
+not approximations, so the numpy model does not mirror them. The shader was checked
 against that model on real GPU output: correlation 0.98 over stable pixels,
 mean difference well under one 8-bit step. The
 HLSL constant buffer hardcodes `float4 cellAmplitude[1024]`.
@@ -192,8 +195,8 @@ values, and compare against the Python functions. Last check: 1032/1032.
 | top | `#include "watermark.h"`, `"background.h"` |
 | globals | `g_watermark`; test-capture globals; backdrop globals |
 | `ResolveBackgroundPath()`, `DrawBackground()` | backdrop selection and drawing |
-| `SaveBackbufferPPM()` | test hook |
-| `main()` top | `--background`, `--capture` parsing |
+| `SaveTexturePPM()`, `SaveBackbufferPPM()`, `PipelineProbe` | test hook: format-aware PPM writer, pipeline-state check |
+| `main()` top | `--background`, `--capture`, `--format`, `--size`, `--novsync` parsing |
 | after `ImGui_ImplDX11_Init` | watermark init, payload, strength, backdrop load |
 | after `ImGui::NewFrame()` | `DrawBackground(show_background)` |
 | Watermark panel | ID, strength slider (0–0.20), "Alternate polarity (experimental)", "Show background" |
@@ -224,9 +227,12 @@ unmarked one second) to skip re-rendering.
 
 ```
 example_win32_directx11.exe --capture <out.ppm> <match_id> [strength] [--background <file>]
+                            [--format rgba8|bgra8|rgb10|srgb] [--size <w> <h>] [--novsync]
 ```
 
-Renders 8 frames, writes the backbuffer as binary PPM, exits. Strength 0 gives
+Renders 8 frames, writes the backbuffer as binary PPM and the unmarked scene
+as `<out.ppm>.scene.ppm`, prints `pipeline state restored: ok|FAILED (...)`
+and `watermark pass: <ms> ms`, exits. Strength 0 gives
 an unmarked frame. Added purely for testing; harmless in normal use.
 
 ### Results in brief

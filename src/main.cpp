@@ -47,6 +47,36 @@ static bool g_capture_random_id = false;
 static int g_capture_frames = 0;
 static float g_capture_strength = -1.0f;
 
+// Test and measurement switches. "--format rgba8|bgra8|rgb10|srgb" picks the
+// swap chain format so the embedder's format handling can be exercised;
+// "--size <w> <h>" sets the client area; "--novsync" presents without
+// waiting for the display so the GPU timer sees a busy clock.
+static DXGI_FORMAT g_swapchain_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+static const char* g_swapchain_format_name = "rgba8";
+static int g_window_width = 1280;
+static int g_window_height = 800;
+static bool g_vsync = true;
+
+static bool ParseSwapChainFormat(const char* name)
+{
+    struct { const char* name; DXGI_FORMAT format; } const table[] = {
+        { "rgba8", DXGI_FORMAT_R8G8B8A8_UNORM },
+        { "bgra8", DXGI_FORMAT_B8G8R8A8_UNORM },
+        { "rgb10", DXGI_FORMAT_R10G10B10A2_UNORM },
+        { "srgb",  DXGI_FORMAT_R8G8B8A8_UNORM_SRGB },
+    };
+    for (const auto& entry : table)
+    {
+        if (strcmp(name, entry.name) == 0)
+        {
+            g_swapchain_format = entry.format;
+            g_swapchain_format_name = entry.name;
+            return true;
+        }
+    }
+    return false;
+}
+
 // Backdrop image drawn beneath the ImGui windows, so the frames carry the
 // texture and edges of a real application rather than a flat clear colour.
 static ID3D11ShaderResourceView* g_backgroundView = nullptr;
@@ -110,44 +140,156 @@ static void DrawBackground(bool enabled)
     ImGui::GetBackgroundDrawList()->AddImage(ImTextureRef((ImTextureID)(intptr_t)g_backgroundView), p0, p1);
 }
 
-static void SaveBackbufferPPM(const char* path)
+// Converts one row of the given format to 8-bit RGB. sRGB variants hold the
+// same display codes as their UNORM twins, so they need no conversion; the
+// 10-bit format is rounded down to 8 bits.
+static bool ConvertRowToRGB8(DXGI_FORMAT format, const unsigned char* row, UINT width, unsigned char* out)
 {
-    ID3D11Texture2D* backbuffer = nullptr;
-    if (FAILED(g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&backbuffer))))
-        return;
+    switch (format)
+    {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        for (UINT x = 0; x < width; ++x)
+        {
+            out[x * 3 + 0] = row[x * 4 + 0];
+            out[x * 3 + 1] = row[x * 4 + 1];
+            out[x * 3 + 2] = row[x * 4 + 2];
+        }
+        return true;
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        for (UINT x = 0; x < width; ++x)
+        {
+            out[x * 3 + 0] = row[x * 4 + 2];
+            out[x * 3 + 1] = row[x * 4 + 1];
+            out[x * 3 + 2] = row[x * 4 + 0];
+        }
+        return true;
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        for (UINT x = 0; x < width; ++x)
+        {
+            unsigned int packed = 0;
+            memcpy(&packed, row + x * 4, 4);
+            const unsigned int channels[3] = { packed & 1023u, (packed >> 10) & 1023u, (packed >> 20) & 1023u };
+            for (int c = 0; c < 3; ++c)
+                out[x * 3 + c] = (unsigned char)((channels[c] * 255u + 511u) / 1023u);
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Copies a GPU texture to the CPU and writes it as a binary PPM.
+static bool SaveTexturePPM(ID3D11Texture2D* texture, const char* path)
+{
+    if (!texture)
+        return false;
 
     D3D11_TEXTURE2D_DESC desc = {};
-    backbuffer->GetDesc(&desc);
+    texture->GetDesc(&desc);
     desc.Usage = D3D11_USAGE_STAGING;
     desc.BindFlags = 0;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     desc.MiscFlags = 0;
 
+    bool written = false;
     ID3D11Texture2D* staging = nullptr;
     if (SUCCEEDED(g_pd3dDevice->CreateTexture2D(&desc, nullptr, &staging)))
     {
-        g_pd3dDeviceContext->CopyResource(staging, backbuffer);
+        g_pd3dDeviceContext->CopyResource(staging, texture);
         D3D11_MAPPED_SUBRESOURCE mapped;
         if (SUCCEEDED(g_pd3dDeviceContext->Map(staging, 0, D3D11_MAP_READ, 0, &mapped)))
         {
             FILE* file = fopen(path, "wb");
-            if (file)
+            unsigned char* rgb = (unsigned char*)malloc((size_t)desc.Width * 3);
+            if (file && rgb)
             {
                 fprintf(file, "P6\n%u %u\n255\n", desc.Width, desc.Height);
-                for (UINT y = 0; y < desc.Height; ++y)
+                written = true;
+                for (UINT y = 0; y < desc.Height && written; ++y)
                 {
                     const unsigned char* row = (const unsigned char*)mapped.pData + (size_t)y * mapped.RowPitch;
-                    for (UINT x = 0; x < desc.Width; ++x)
-                        fwrite(row + (size_t)x * 4, 1, 3, file);
+                    written = ConvertRowToRGB8(desc.Format, row, desc.Width, rgb);
+                    if (written)
+                        fwrite(rgb, 1, (size_t)desc.Width * 3, file);
                 }
-                fclose(file);
+                if (!written)
+                    fprintf(stderr, "cannot write format %d as PPM\n", (int)desc.Format);
             }
+            free(rgb);
+            if (file)
+                fclose(file);
             g_pd3dDeviceContext->Unmap(staging, 0);
         }
         staging->Release();
     }
-    backbuffer->Release();
+    return written;
 }
+
+static bool SaveBackbufferPPM(const char* path)
+{
+    ID3D11Texture2D* backbuffer = nullptr;
+    if (FAILED(g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&backbuffer))))
+        return false;
+    const bool written = SaveTexturePPM(backbuffer, path);
+    backbuffer->Release();
+    return written;
+}
+
+// Capture-mode check that the watermark pass leaves the pipeline as it found
+// it: a handful of slots are read before Apply and compared afterwards.
+struct PipelineProbe
+{
+    ID3D11RenderTargetView* renderTarget = nullptr;
+    ID3D11PixelShader* pixelShader = nullptr;
+    ID3D11BlendState* blendState = nullptr;
+    ID3D11RasterizerState* rasteriser = nullptr;
+    ID3D11ShaderResourceView* shaderResource = nullptr;
+    D3D11_VIEWPORT viewport = {};
+    UINT viewportCount = 0;
+    D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+
+    void Read()
+    {
+        ID3D11DepthStencilView* depth = nullptr;
+        g_pd3dDeviceContext->OMGetRenderTargets(1, &renderTarget, &depth);
+        if (depth) depth->Release();
+        g_pd3dDeviceContext->PSGetShader(&pixelShader, nullptr, nullptr);
+        float factor[4]; UINT mask;
+        g_pd3dDeviceContext->OMGetBlendState(&blendState, factor, &mask);
+        g_pd3dDeviceContext->RSGetState(&rasteriser);
+        g_pd3dDeviceContext->PSGetShaderResources(0, 1, &shaderResource);
+        viewportCount = 1;
+        g_pd3dDeviceContext->RSGetViewports(&viewportCount, &viewport);
+        g_pd3dDeviceContext->IAGetPrimitiveTopology(&topology);
+    }
+
+    void Free()
+    {
+        if (renderTarget) renderTarget->Release();
+        if (pixelShader) pixelShader->Release();
+        if (blendState) blendState->Release();
+        if (rasteriser) rasteriser->Release();
+        if (shaderResource) shaderResource->Release();
+    }
+
+    // Returns the name of the first slot that differs, or null if none does.
+    const char* Differs(const PipelineProbe& other) const
+    {
+        if (renderTarget != other.renderTarget) return "render target";
+        if (pixelShader != other.pixelShader) return "pixel shader";
+        if (blendState != other.blendState) return "blend state";
+        if (rasteriser != other.rasteriser) return "rasteriser state";
+        if (shaderResource != other.shaderResource) return "shader resource 0";
+        if (viewportCount != other.viewportCount) return "viewport count";
+        if (viewportCount && memcmp(&viewport, &other.viewport, sizeof(viewport)) != 0) return "viewport";
+        if (topology != other.topology) return "primitive topology";
+        return nullptr;
+    }
+};
 
 // Forward declarations of helper functions
 bool CreateDeviceD3D(HWND hWnd);
@@ -159,7 +301,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 // Main code
 int main(int argc, char** argv)
 {
-    for (int i = 1; i + 2 < argc + 1; ++i)
+    for (int i = 1; i < argc; ++i)
     {
         if (strcmp(argv[i], "--background") == 0 && i + 1 < argc)
             g_background_arg = argv[i + 1];
@@ -170,9 +312,28 @@ int main(int argc, char** argv)
                 g_capture_random_id = true;
             else
                 g_capture_id = (unsigned int)strtoul(argv[i + 2], nullptr, 10);
-            if (i + 3 < argc)
+            // The optional strength follows; anything starting with "--" is
+            // the next switch instead.
+            if (i + 3 < argc && strncmp(argv[i + 3], "--", 2) != 0)
                 g_capture_strength = (float)atof(argv[i + 3]);
         }
+        if (strcmp(argv[i], "--format") == 0 && i + 1 < argc && !ParseSwapChainFormat(argv[i + 1]))
+        {
+            fprintf(stderr, "unknown format '%s': use rgba8, bgra8, rgb10 or srgb\n", argv[i + 1]);
+            return 1;
+        }
+        if (strcmp(argv[i], "--size") == 0 && i + 2 < argc)
+        {
+            g_window_width = atoi(argv[i + 1]);
+            g_window_height = atoi(argv[i + 2]);
+            if (g_window_width <= 0 || g_window_height <= 0)
+            {
+                fprintf(stderr, "--size needs a positive width and height\n");
+                return 1;
+            }
+        }
+        if (strcmp(argv[i], "--novsync") == 0)
+            g_vsync = false;
     }
     // Make process DPI aware and obtain main monitor scale
     ImGui_ImplWin32_EnableDpiAwareness();
@@ -181,7 +342,12 @@ int main(int argc, char** argv)
     // Create application window
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr, L"ImGui Example", nullptr };
     ::RegisterClassExW(&wc);
-    HWND hwnd = ::CreateWindowW(wc.lpszClassName, L"Dear ImGui DirectX11 Example", WS_OVERLAPPEDWINDOW, 100, 100, (int)(1280 * main_scale), (int)(800 * main_scale), nullptr, nullptr, wc.hInstance, nullptr);
+    // --size names the client area, so the frame is added around it.
+    RECT window_rect = { 0, 0, (LONG)(g_window_width * main_scale), (LONG)(g_window_height * main_scale) };
+    ::AdjustWindowRect(&window_rect, WS_OVERLAPPEDWINDOW, FALSE);
+    HWND hwnd = ::CreateWindowW(wc.lpszClassName, L"Dear ImGui DirectX11 Example", WS_OVERLAPPEDWINDOW, 100, 100,
+                                window_rect.right - window_rect.left, window_rect.bottom - window_rect.top,
+                                nullptr, nullptr, wc.hInstance, nullptr);
 
     // Initialize Direct3D
     if (!CreateDeviceD3D(hwnd))
@@ -221,7 +387,8 @@ int main(int argc, char** argv)
     ::GetClientRect(hwnd, &client_rect);
     bool watermark_ready = g_watermark.Initialise(g_pd3dDevice, g_pd3dDeviceContext)
                         && g_watermark.ResizeBuffers(client_rect.right - client_rect.left,
-                                                     client_rect.bottom - client_rect.top);
+                                                     client_rect.bottom - client_rect.top,
+                                                     g_swapchain_format);
     unsigned int match_id = (g_capture_path && !g_capture_random_id) ? g_capture_id : RandomMatchId();
     // Report the ID in use, so a capture run can be checked against it and a
     // live run tells the operator which ID this session is stamping.
@@ -288,7 +455,7 @@ int main(int argc, char** argv)
         {
             CleanupRenderTarget();
             g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
-            g_watermark.ResizeBuffers(g_ResizeWidth, g_ResizeHeight);
+            g_watermark.ResizeBuffers(g_ResizeWidth, g_ResizeHeight, g_swapchain_format);
             g_ResizeWidth = g_ResizeHeight = 0;
             CreateRenderTarget();
         }
@@ -373,6 +540,15 @@ int main(int argc, char** argv)
                 ImGui::TextUnformatted("No backdrop image found (use --background <file>).");
 
             ImGui::Separator();
+            const float pass_ms = g_watermark.LastPassMilliseconds();
+            if (pass_ms >= 0.0f)
+                ImGui::Text("Watermark pass: %.3f ms GPU (%s)", pass_ms, g_vsync ? "vsync on, clocks may idle" : "vsync off");
+            else
+                ImGui::TextUnformatted("Watermark pass: not measured yet");
+            ImGui::Text("Swap chain: %s%s", g_swapchain_format_name,
+                        g_swapchain_format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ? " (brighter look is expected: test mode)" : "");
+
+            ImGui::Separator();
             ImGui::TextUnformatted("Raise strength until the decoder recovers");
             ImGui::TextUnformatted("the ID from your capture, then back off.");
             if (!watermark_ready)
@@ -403,16 +579,47 @@ int main(int argc, char** argv)
         g_pd3dDeviceContext->ClearRenderTargetView(frame_target, clear_color_with_alpha);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         if (use_watermark)
-            g_watermark.Apply(g_mainRenderTargetView);
+        {
+            if (g_capture_path)
+            {
+                // Verify the pass hands the pipeline back untouched.
+                PipelineProbe before, after;
+                before.Read();
+                g_watermark.Apply(g_mainRenderTargetView);
+                after.Read();
+                const char* changed = before.Differs(after);
+                before.Free();
+                after.Free();
+                if (g_capture_frames == 0)
+                {
+                    if (changed)
+                        printf("pipeline state restored: FAILED (%s)\n", changed);
+                    else
+                        printf("pipeline state restored: ok\n");
+                }
+            }
+            else
+                g_watermark.Apply(g_mainRenderTargetView);
+        }
 
         // Present
-        HRESULT hr = g_pSwapChain->Present(1, 0);   // Present with vsync
-        //HRESULT hr = g_pSwapChain->Present(0, 0); // Present without vsync
+        HRESULT hr = g_pSwapChain->Present(g_vsync ? 1 : 0, 0);
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
 
         if (g_capture_path && ++g_capture_frames >= 8)
         {
             SaveBackbufferPPM(g_capture_path);
+            // The unmarked frame as well, so a test can check that the pass
+            // at strength 0 is the identity in every format.
+            char scene_path[MAX_PATH];
+            snprintf(scene_path, sizeof(scene_path), "%s.scene.ppm", g_capture_path);
+            SaveTexturePPM(g_watermark.SceneTexture(), scene_path);
+            const float pass_ms = g_watermark.LastPassMilliseconds();
+            if (pass_ms >= 0.0f)
+                printf("watermark pass: %.3f ms\n", pass_ms);
+            else
+                printf("watermark pass: not measured\n");
+            fflush(stdout);
             break;
         }
     }
@@ -442,7 +649,7 @@ bool CreateDeviceD3D(HWND hWnd)
     sd.BufferCount = 2;
     sd.BufferDesc.Width = 0;
     sd.BufferDesc.Height = 0;
-    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferDesc.Format = g_swapchain_format;
     sd.BufferDesc.RefreshRate.Numerator = 60;
     sd.BufferDesc.RefreshRate.Denominator = 1;
     sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;

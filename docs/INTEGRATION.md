@@ -17,9 +17,9 @@ Measured against upstream Dear ImGui at commit `e0a2f6d`:
 
 | File | Change |
 |---|---|
-| `main.cpp` | +244 lines, of which **~20 are the integration**; the rest is the demo backdrop, the control panel and the test capture hook |
+| `main.cpp` | about +450 lines, of which **~20 are the integration**; the rest is the demo backdrop, the control panel, the test capture hook and its format, size and vsync switches |
 | `example_win32_directx11.vcxproj` | +4 lines, adding the two new translation units |
-| `watermark.cpp/h` | New, 635 lines — the embedder |
+| `watermark.cpp/h` | New, about 1090 lines — the embedder, of which roughly a third is state save/restore, format handling and timing |
 | `background.cpp/h` | New, 125 lines — demo backdrop only, not part of the watermark |
 
 No upstream ImGui file is modified. The embedder does not depend on ImGui at
@@ -55,7 +55,8 @@ RECT client_rect;
 bool watermark_ready =
     g_watermark.Initialise(g_pd3dDevice, g_pd3dDeviceContext) &&
     g_watermark.ResizeBuffers(client_rect.right  - client_rect.left,
-                              client_rect.bottom - client_rect.top);
+                              client_rect.bottom - client_rect.top,
+                              swapchain_format);   // the format of the view you render with
 
 g_watermark.SetPayload(match_id);   // the 32-bit ID this session stamps
 ```
@@ -63,7 +64,9 @@ g_watermark.SetPayload(match_id);   // the 32-bit ID this session stamps
 `Initialise` compiles the shaders and creates the state objects. `ResizeBuffers`
 creates the offscreen target and must be called at least once before the first
 frame. Both return `false` rather than throwing; if either fails, keep
-rendering without the watermark rather than failing the frame.
+rendering without the watermark rather than failing the frame. The format
+argument defaults to `DXGI_FORMAT_R8G8B8A8_UNORM`; see below for what else it
+accepts.
 
 ### 3. Keep the offscreen target in step with the swap chain
 
@@ -72,7 +75,7 @@ In the existing resize handler, next to `ResizeBuffers` on the swap chain:
 ```cpp
 CleanupRenderTarget();
 g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
-g_watermark.ResizeBuffers(g_ResizeWidth, g_ResizeHeight);   // <-- added
+g_watermark.ResizeBuffers(g_ResizeWidth, g_ResizeHeight, swapchain_format);   // <-- added
 g_ResizeWidth = g_ResizeHeight = 0;
 CreateRenderTarget();
 ```
@@ -133,13 +136,16 @@ initialise.
 | Call | When | Notes |
 |---|---|---|
 | `Initialise(device, context)` | Once, after the device exists | Returns false on shader compile or state creation failure |
-| `ResizeBuffers(w, h)` | Startup and every swap-chain resize | Recreates the offscreen target |
+| `ResizeBuffers(w, h, format)` | Startup and every swap-chain resize | Recreates the offscreen target in the given view format; false for an unsupported format |
 | `SceneTarget()` | Each frame, to pick the render target | Null until `ResizeBuffers` succeeds |
-| `Apply(destination)` | Each frame, after drawing, before Present | Draws the marked frame to `destination` |
+| `SceneTexture()` | Tests and debugging | The texture behind `SceneTarget()`, the unmarked frame |
+| `Apply(destination)` | Each frame, after drawing, before Present | Draws the marked frame to `destination`; saves and restores the pipeline state it touches |
 | `SetPayload(uint32_t)` | Whenever the ID changes | Takes effect next frame; re-derives the pattern |
 | `SetStrength(float)` | Tuning | Peak chroma offset at a cell centre; default 0.08 |
 | `SetEnabled(bool)` | Toggling | When false, skip `SceneTarget`/`Apply` entirely |
 | `SetAlternatePolarity(bool)` | Experimental | Flips the pattern sign every 25 ms |
+| `SetRestoresState(bool)` | Only if you push/pop state yourself | Default true; see below |
+| `LastPassMilliseconds()` | Profiling | GPU time of the most recent resolved pass; negative until the first sample |
 | `Release()` | Before destroying the device | Idempotent |
 
 `SetPayload` is the only one with real cost: it rebuilds the 1024-cell sign
@@ -151,23 +157,27 @@ would break decoding, which averages a bit's copies across frames.
 
 ## Integrating into a renderer that is not this demo
 
-The demo is a clean case: one render target, no depth buffer, no state the
-watermark pass needs to preserve. Four things differ in a real engine.
+The demo is a clean case: one render target, no depth buffer, one swap-chain
+format. Four things to know before putting the pass into a real engine.
 
-### Pipeline state is not saved or restored
+### Pipeline state is saved and restored
 
-`Apply` sets the render target, viewport, rasteriser state, depth-stencil
-state, blend state, input layout, primitive topology, vertex and pixel
-shaders, one shader resource, one sampler and one constant buffer, and it
-clears the geometry, hull and domain shader stages. It does **not** save what
-was there before, and it restores nothing but the shader resource binding it
-unbinds at the end.
+`Apply` sets the render targets, viewport, rasteriser state, depth-stencil
+state, blend state, input layout, primitive topology, all five shader stages,
+two pixel-shader resource slots, one sampler and one constant buffer. It reads
+every one of those slots on entry and puts them back on exit, the same way
+Dear ImGui's own DX11 backend does, so an engine with a state cache sees the
+context exactly as it left it. The demo checks this on every `--capture` run
+and prints `pipeline state restored: ok`.
 
-In the demo this is fine, because `Apply` runs last and the next frame sets
-everything it needs. In an engine with its own state cache, either wrap the
-call in your own push/pop, or mark the cached state dirty afterwards. The
-symptom of getting this wrong is not a broken watermark but corrupted drawing
-in whatever runs next.
+Two things cannot be put back, because Direct3D itself unbinds them: any
+pixel-shader UAVs (binding a render target clears them) and any shader
+resource view over the destination's own resource (the render-target hazard
+rule). Neither is normally live at the point just before Present.
+
+If your engine already brackets external passes with its own state push and
+pop, `SetRestoresState(false)` skips the save and restore. The pass then still
+unbinds its own shader resources on exit, as it always has.
 
 ### It must be the last thing before Present
 
@@ -179,17 +189,42 @@ the mark by construction. That is usually harmless, since the decoder tolerates
 the frame costs more than its area suggests, because the perceptual weight put
 most of the mark's energy there.
 
-### The offscreen target is `R8G8B8A8_UNORM`
+### The offscreen target takes the swap chain's format
 
-`ResizeBuffers` creates the intermediate as `DXGI_FORMAT_R8G8B8A8_UNORM` with
-`D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE`. If your swap chain is
-a different format — sRGB, 10-bit, or an HDR float target — the pass will
-either fail to create or silently change the colour handling of your frame.
-Match the format to the swap chain's before using it anywhere but this demo.
+`ResizeBuffers(w, h, format)` creates the intermediate to match the render
+target view you draw with. Pass the **view** format, which on a flip-model
+swap chain may be the sRGB twin of the buffer format. Supported:
 
-For an HDR target the mark's design assumptions also change: the perceptual
-weight is built around luma in 0..1 and a fixed offset in display-referred
-units. That needs revisiting rather than porting.
+| Format | Notes |
+|---|---|
+| `R8G8B8A8_UNORM`, `B8G8R8A8_UNORM` | The common cases; the default is RGBA8 |
+| `R8G8B8A8_UNORM_SRGB`, `B8G8R8A8_UNORM_SRGB` | See below |
+| `R10G10B10A2_UNORM` | 10-bit SDR |
+
+Anything else returns `false`: typeless and unknown formats because they are
+ambiguous, and float HDR targets because the mark is defined in
+display-referred 0..1 units. The shader's clamps are wrong above 1.0, and the
+perceptual weight assumes luma in 0..1, so HDR needs a redesign of the weight
+model rather than a wider format list.
+
+**How sRGB is handled.** The intermediate is created typeless. Its render
+target view carries your format, sRGB or not, so your drawing into it behaves
+exactly as drawing into the swap chain did, encode-on-write included. Its
+shader resource view is always the plain UNORM twin, so the pass reads the
+encoded display codes, which is the domain the perceptual weight and the
+Python decoder are defined in. When the destination view is sRGB the shader
+decodes its result to linear before writing, so the hardware's encode-on-write
+reproduces the encoded value; that decode uses the exact sRGB curve, and
+encode(decode(x)) returns x for every 8-bit code. The demo verifies this on
+hardware: at strength 0 the swap-chain contents equal the unmarked scene byte
+for byte in every supported format. Nothing is ever created over the
+destination's own resource, so the same path works for typed sRGB textures and
+for flip-model chains with a UNORM buffer and an sRGB view.
+
+The demo takes `--format rgba8|bgra8|rgb10|srgb` to exercise all of this. In
+`srgb` mode the demo itself looks brighter, because ImGui writes
+already-encoded colours that the sRGB view encodes again; that is a test-mode
+artefact, not a watermark bug.
 
 ### No depth buffer is bound
 
@@ -205,21 +240,38 @@ where it will complain.
 One full-screen triangle reading one texture, with the perceptual weight
 computed in the pixel shader. The weight is the expensive part: local luma
 activity costs nine samples (a centre plus eight on a ring), and that is
-eroded over a 3×3 of positions, so the shader does **82 texture reads per
-pixel** — 9 × 9 for the weight, plus one for the scene colour itself.
+eroded over a 3×3 of positions, so a pixel that needs the full measure does
+**82 texture reads** — 9 × 9 for the weight, plus one for the scene colour.
 
-They are all cache-friendly reads of the same small neighbourhood, so the
-measured cost is far below what the count suggests, but it is the one part of
-this design that is not free.
+Most pixels do not need it. Two early-outs skip the reads where they cannot
+change the result: a pixel too dark to carry anything has weight 0 whatever
+its texture, and because the erosion is a minimum, a centre activity already
+at or below the lower threshold makes the texture term exactly 0 no matter
+what the other eight positions read. Those pixels cost 1 or 10 reads. The
+output is identical at every pixel; the early-outs were checked against the
+full shader by byte-comparing captures.
 
-The demo presents with vsync, so its frame counter says nothing useful about
-the pass. It has not been profiled in isolation. Measure it with a GPU timer
-query around `Apply` before budgeting for it on a heavier scene: the cost
-scales with pixel count and is independent of scene complexity, so one
-measurement at your resolution generalises.
+`Apply` times itself with GPU timestamp queries, read back without stalling a
+few frames later, and `LastPassMilliseconds()` returns the latest resolved
+value. The demo shows it in the Watermark panel and prints it after a
+`--capture` run. Measured on an NVIDIA GeForce RTX 5090 with vsync off, over
+the demo's backdrop with the demo window open:
+
+| Client size | Full shader | With early-outs |
+|---|---|---|
+| 1280×800 | 0.048 ms | 0.017 ms |
+| 2560×1440 | 0.162 ms | 0.048 ms |
+| 3840×2160 | not measured | 0.065 ms |
+
+The cost scales with pixel count and is independent of scene complexity, so
+one measurement at your resolution on your hardware generalises. Expect an
+integrated GPU to be several times slower. With vsync on the GPU idles between
+frames and its clocks drop, so the readout runs 20 to 40% higher than the
+pass really costs; the demo's `--novsync` switch exists for measuring.
 
 The one-off costs are the shader compilation in `Initialise` and the offscreen
-target allocation in `ResizeBuffers` (width × height × 4 bytes).
+target allocation in `ResizeBuffers` (width × height × 4 bytes in every
+supported format).
 
 **The pass must run at native resolution.** The sampler is
 `MIN_MAG_MIP_POINT`, and the cell grid is laid out in the target's own pixels.
@@ -272,4 +324,7 @@ unambiguously in the embedder rather than in a screen-capture path.
 
 Then `python tools/test_gpu_frames.py`, which drives that hook across several
 payloads and strengths and decodes each result. It is the suite that catches an
-embedder and decoder that have drifted apart.
+embedder and decoder that have drifted apart. It also asserts the pipeline
+state check on every run, decodes a capture in each of the four supported
+swap-chain formats, checks that the pass at strength 0 is the identity in each
+of them, and prints the pass time at three resolutions.

@@ -22,3 +22,6 @@ __pycache__/
 # Captures and scratch output
 *.ppm
 captures/
+
+# Written by the example when run from the repo root
+imgui.ini
