@@ -1,0 +1,7 @@
+# Shell scripts must keep LF endings or they will not run.
+*.sh text eol=lf
+
+# Binary assets
+*.jpg binary
+*.png binary
+*.ppm binary

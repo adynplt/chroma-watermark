@@ -1,0 +1,24 @@
+# Dear ImGui is fetched by setup.sh, not vendored.
+/imgui/
+
+# Build output
+[Dd]ebug/
+[Rr]elease/
+x64/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.idb
+*.tlog
+*.log
+*.user
+.vs/
+
+# Python
+__pycache__/
+*.pyc
+
+# Captures and scratch output
+*.ppm
+captures/
