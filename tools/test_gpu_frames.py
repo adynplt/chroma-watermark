@@ -24,7 +24,7 @@ from read_ppm import read_ppm
 
 DEFAULT_EXE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "imgui", "examples", "example_win32_directx11", "Release",
+    "desktop", "imgui", "examples", "example_win32_directx11", "Release",
     "example_win32_directx11.exe")
 
 PAYLOADS = [0, 1, 42, 1234567, 65535, 2147483648, 4294967295]

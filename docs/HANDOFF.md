@@ -37,7 +37,7 @@ section 7.
 
 | | |
 |---|---|
-| Working directory | The repository root; `setup.sh` puts Dear ImGui in `imgui/` beneath it |
+| Working directory | `desktop/` for building; `setup.sh` puts Dear ImGui in `desktop/imgui/`. Python tools run from the repository root |
 | Platform | Windows 11 Pro, PowerShell + Git Bash both available |
 | Visual Studio | **VS 2026 Community** at `C:\Program Files\Microsoft Visual Studio\18\Community` |
 | Toolset | v145, Windows SDK 10.0.26100.0, x64 |
@@ -47,6 +47,7 @@ section 7.
 ### Build
 
 ```bash
+cd desktop
 ./build.sh            # Debug
 ./build.sh Release    # Release
 ```
@@ -71,48 +72,63 @@ from the test hook in `main.cpp`; harmless.
 
 ```
 <repository root>/
-├── setup.sh                    # clones Dear ImGui at a pinned commit, grafts src/ in
-├── build.sh                    # build wrapper with SDK/toolset overrides
-├── README.md                   # overview, modes, what survives
-├── src/                        # the files this project owns, copied in by setup.sh
-│   ├── main.cpp                # MODIFIED example — integration, backdrop, capture hook
-│   ├── watermark.h             # layout constants
-│   ├── watermark.cpp           # embedder + HLSL shaders
-│   └── background.h/.cpp       # WIC image loader -> D3D11 texture
-├── assets/
-│   └── background.jpg          # default backdrop (Windows ThemeA wallpaper, 3840x2400)
+├── README.md                   # overview of both implementations, modes, what survives
+├── desktop/                    # the Direct3D 11 implementation
+│   ├── setup.sh                # clones Dear ImGui at a pinned commit, grafts src/ in
+│   ├── build.sh                # build wrapper with SDK/toolset overrides
+│   ├── src/                    # the files this project owns, copied in by setup.sh
+│   │   ├── main.cpp            # MODIFIED example — integration, backdrop, capture hook
+│   │   ├── watermark.h         # layout constants and the FrameWatermark API
+│   │   ├── watermark.cpp       # embedder + HLSL shaders
+│   │   └── background.h/.cpp   # WIC image loader -> D3D11 texture
+│   ├── assets/
+│   │   └── background.jpg      # default backdrop (Windows ThemeA wallpaper, 3840x2400)
+│   └── imgui/                  # NOT in version control; created by setup.sh
+│       └── examples/example_win32_directx11/
+│           ├── <the five src/ files, copied here>
+│           ├── example_win32_directx11.vcxproj   # MODIFIED — added the two new .cpp files
+│           └── Release/example_win32_directx11.exe
+├── web/                        # the WebGL implementation
+│   ├── index.html              # BUILT single-file demo (website view + full-screen view)
+│   ├── app.html                # the demo's source
+│   ├── watermark.js            # the embedder; pattern functions bit-identical to the C++
+│   ├── assets/                 # PNG copies of two wallpapers
+│   ├── tools/build.py          # bundles app.html + watermark.js + images into index.html
+│   ├── tools/verify.py         # headless Chrome renders, decoded with ../tools
+│   └── README.md               # usage, API, limits of the client-side approach
 ├── docs/
-│   ├── INTEGRATION.md          # renderer-side changes and porting caveats
+│   ├── INTEGRATION.md          # D3D11 renderer-side changes and porting caveats
 │   ├── DESIGN.md               # design, rationale, measurements
 │   └── HANDOFF.md              # this file
 ├── examples/
 │   └── roundtrip_demo.py       # self-contained numpy demo, no GPU or build needed
-├── tools/
-│   ├── decode_watermark.py     # THE DECODER + CLI; all shared constants live here
-│   ├── read_ppm.py             # PPM reader for test captures
-│   ├── test_roundtrip.py       # decoder vs a numpy model of the shader
-│   ├── test_gpu_frames.py      # decoder vs real GPU frames
-│   ├── test_occlusion.py       # decoding with part of the frame covered
-│   ├── test_sync.py            # grid search on warped captures; negatives
-│   └── test_video.py           # tracking drifting H.264 clips (needs ffmpeg)
-└── imgui/                      # NOT in version control; created by setup.sh
-    └── examples/example_win32_directx11/
-        ├── <the five src/ files, copied here>
-        ├── example_win32_directx11.vcxproj   # MODIFIED — added the two new .cpp files
-        └── Release/example_win32_directx11.exe
+└── tools/                      # shared by both implementations
+    ├── decode_watermark.py     # THE DECODER + CLI; all shared constants live here
+    ├── read_ppm.py             # PPM reader for test captures
+    ├── test_roundtrip.py       # decoder vs a numpy model of the shader
+    ├── test_gpu_frames.py      # decoder vs real GPU frames from desktop/
+    ├── test_occlusion.py       # decoding with part of the frame covered
+    ├── test_sync.py            # grid search on warped captures; negatives
+    └── test_video.py           # tracking drifting H.264 clips (needs ffmpeg)
 ```
 
-`src/` is the authority: edit there, re-run `setup.sh` to copy into the ImGui
-tree, then build. Editing the copies under `imgui/` works for a quick
-experiment but is lost the next time setup runs, and is not version-controlled.
+`desktop/src/` is the authority: edit there, re-run `setup.sh` to copy into
+the ImGui tree, then build. Editing the copies under `desktop/imgui/` works
+for a quick experiment but is lost the next time setup runs, and is not
+version-controlled. On the web side `web/app.html` and `web/watermark.js`
+are the authority and `web/index.html` is regenerated by `web/tools/build.py`.
 
 Only `main.cpp` and the `.vcxproj` are modified upstream files; everything else
-in `imgui/` is untouched.
+in `desktop/imgui/` is untouched.
+
+The places that must agree on the shared constants are
+`desktop/src/watermark.cpp`, `web/watermark.js` and
+`tools/decode_watermark.py`; the parity table below lists them.
 
 ### The backdrop
 
 `main.cpp` resolves the image in this order: `--background <file>`, then
-`assets/background.jpg` found four directory levels above the executable,
+`desktop/assets/background.jpg` found four directory levels above the executable,
 then `C:\Windows\Web\Wallpaper\ThemeA\img20.jpg`, else none. It is decoded
 with Windows Imaging Component (no new dependency), drawn with
 `ImGui::GetBackgroundDrawList()->AddImage` scaled to cover the viewport, and

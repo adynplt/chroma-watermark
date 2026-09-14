@@ -1,5 +1,5 @@
 # Dear ImGui is fetched by setup.sh, not vendored.
-/imgui/
+/desktop/imgui/
 
 # Build output
 [Dd]ebug/

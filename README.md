@@ -11,9 +11,17 @@ partial occlusion of the window, while staying below the visible threshold at
 because the eye is several times less sensitive to low-frequency blue-yellow
 detail than to brightness.
 
-This repository is a working demonstration built on the Dear ImGui
-Win32/DirectX11 example: a GPU embedder in HLSL, a Python decoder, and five
-test suites that measure what actually survives.
+This repository holds two implementations of the same mark and one decoder
+for both:
+
+- **`desktop/`**: a Direct3D 11 post-process pass in HLSL, demonstrated on the
+  Dear ImGui Win32/DirectX11 example. For marking a native application's
+  window.
+- **`web/`**: the same pass as WebGL, for marking an image, video or canvas in
+  a web page. One self-contained `index.html` demonstrates it on an
+  ordinary-looking website and in a full-screen view.
+- **`tools/`**: the Python decoder and the test suites, shared by both. A
+  screenshot of either decodes with the same command.
 
 **Scope.** The intended use is marking your *own* application's window with
 your *own* identifier, so a leaked screenshot or recording of it can be traced
@@ -26,12 +34,16 @@ adversarially robust; see [Limits](#limits).
 
 | Path | What it is |
 |---|---|
-| `src/watermark.{cpp,h}` | The embedder: pattern layout, HLSL shader, D3D11 plumbing |
-| `src/background.{cpp,h}` | Photo backdrop loader, so the demo runs over realistic content |
-| `src/main.cpp` | Dear ImGui example with the watermark panel and a capture hook |
-| `tools/decode_watermark.py` | The decoder and its command line |
+| `desktop/src/watermark.{cpp,h}` | The D3D11 embedder: pattern layout, HLSL shader, D3D11 plumbing |
+| `desktop/src/background.{cpp,h}` | Photo backdrop loader, so the demo runs over realistic content |
+| `desktop/src/main.cpp` | Dear ImGui example with the watermark panel and a capture hook |
+| `desktop/setup.sh`, `desktop/build.sh` | Fetch Dear ImGui at a pinned commit, graft the sources in, build |
+| `web/watermark.js` | The WebGL embedder, no dependencies; same key, layout and weight |
+| `web/index.html` | Self-contained demo: an ordinary website with one marked element, plus a full-screen view |
+| `web/README.md` | How to use the WebGL embedder on a page, and what it cannot do |
+| `tools/decode_watermark.py` | The decoder and its command line, shared by both |
 | `tools/test_*.py` | Five test suites, described under [Testing](#testing) |
-| `docs/INTEGRATION.md` | **Renderer-side changes**: what the host application has to do |
+| `docs/INTEGRATION.md` | **Renderer-side changes**: what a D3D11 host application has to do |
 | `docs/DESIGN.md` | Full design: format, perceptual weighting, decoding, measurements |
 | `docs/HANDOFF.md` | Implementation notes, known gaps, and what to do next |
 
@@ -39,9 +51,11 @@ adversarially robust; see [Limits](#limits).
 
 ## Quick start
 
+### Desktop
+
 ```bash
 git clone <this repo> chroma-watermark
-cd chroma-watermark
+cd chroma-watermark/desktop
 ./setup.sh                 # clones Dear ImGui at a pinned commit, grafts the example in
 ./build.sh Release         # MSBuild, toolset and SDK overridden on the command line
 imgui/examples/example_win32_directx11/Release/example_win32_directx11.exe
@@ -52,7 +66,7 @@ clear-colour panels are the easiest possible content for the mark and hid real
 weaknesses in the decoder during development. Tick **Watermark** in the
 "Hello, world!" window to open the control panel.
 
-Take a screenshot of the window, then:
+Take a screenshot of the window, then, from the repository root:
 
 ```bash
 pip install numpy scipy opencv-python
@@ -70,6 +84,20 @@ match ID         : 1264723528   (CRC ok)
 The application prints its match ID to stdout at startup, so a capture can be
 checked against the truth.
 
+### Web
+
+Open `web/index.html` in a browser; it needs no server and no other files.
+It lands on an ordinary-looking page whose hero image carries the mark, with
+the ID in the nav (blurred until hovered; type a number and press Enter to
+change it). Take a screenshot and decode the image's rectangle:
+
+```bash
+python tools/decode_watermark.py screenshot.png --box 540 90 680 450
+```
+
+`web/README.md` covers the page's other view, the JavaScript API for marking
+an element of your own page, and the limits of doing this client-side.
+
 ### Requirements
 
 Building needs Visual Studio 2022 or newer with the Desktop C++ workload. The
@@ -78,8 +106,11 @@ build script defaults to Visual Studio 18 with toolset v145 and Windows SDK
 
 ```bash
 MSBUILD="/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/MSBuild.exe" \
-TOOLSET=v143 SDK=10.0.22621.0 ./build.sh Release
+TOOLSET=v143 SDK=10.0.22621.0 ./build.sh Release      # from desktop/
 ```
+
+The web version needs only a browser with WebGL; its verifier additionally
+needs Chrome.
 
 Decoding needs Python 3.9+ with `numpy`, `scipy` and `opencv-python`. Video
 decoding uses OpenCV's ffmpeg backend.
@@ -334,6 +365,7 @@ python tools/test_gpu_frames.py    # decoder vs real frames off the GPU
 python tools/test_occlusion.py     # decoding with part of the frame covered
 python tools/test_sync.py          # finding the grid in warped captures; rejecting unmarked images
 python tools/test_video.py         # tracking drifting H.264 clips (needs ffmpeg)
+python web/tools/verify.py         # WebGL embedder: headless Chrome renders, decoded; needs Chrome
 ```
 
 The suites that render through the real shader (all but the first) matter most,
@@ -392,6 +424,7 @@ of 0.12.
 ## Licence
 
 The watermark sources, decoder and tests in this repository are MIT licensed
-(see `LICENSE`). Dear ImGui is fetched by `setup.sh` and carries its own MIT
-licence. `assets/background.jpg` is a stock Windows wallpaper, included only as
-demo content; substitute your own with `--background <file>`.
+(see `LICENSE`). Dear ImGui is fetched by `desktop/setup.sh` and carries its
+own MIT licence. `desktop/assets/background.jpg` and the images under
+`web/assets/` are stock Windows wallpapers, included only as demo content;
+substitute your own (`--background <file>` for the desktop demo).

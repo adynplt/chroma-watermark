@@ -9,11 +9,12 @@ recording, or a video of the monitor taken with a phone.
 Build, then launch normally:
 
 ```
+cd desktop
 ./build.sh Release
 imgui/examples/example_win32_directx11/Release/example_win32_directx11.exe [--background <image>]
 ```
 
-The window draws a photograph behind the ImGui panels (`assets/background.jpg`
+The window draws a photograph behind the ImGui panels (`desktop/assets/background.jpg`
 by default, a stock Windows wallpaper; any JPEG/PNG/BMP via `--background`).
 This is deliberate: flat clear-colour panels are the easiest possible content
 for the mark and hid real weaknesses in the decoder. A photo gives the

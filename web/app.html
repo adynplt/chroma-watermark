@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Chroma watermark</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+    /* ---- shared ---- */
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+    body { font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; }
+    [hidden] { display: none !important; }
+    a { color: inherit; text-decoration: none; }
+
+    /* ---- full-screen view ---- */
+    body.view-full { background: #000; overflow: hidden; }
+    #frame { display: block; }
+    #panel {
+        position: fixed; top: 12px; left: 12px; padding: 10px 12px;
+        background: rgba(20, 20, 24, 0.86); color: #ddd; border-radius: 6px;
+        font-size: 13px; line-height: 1.5; min-width: 300px;
+    }
+    #panel label { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    #panel input[type=number] { width: 120px; }
+    #panel input[type=range] { width: 140px; }
+    #panel button { margin-top: 6px; }
+    #panel .note { color: #999; font-size: 12px; margin-top: 6px; }
+    #panel .note a { color: #9ab; }
+    #header { display: flex; align-items: center; justify-content: space-between; gap: 16px; font-weight: 600; }
+    #header button { font-weight: normal; }
+    #options { margin-top: 8px; }
+
+    /* ---- website view ---- */
+    :root { --ink: #1c1c22; --muted: #6a6a75; --line: #e4e4ea; --accent: #5b3df5; }
+    body.view-site { background: #fff; color: var(--ink); }
+    .wrap { max-width: 1160px; margin: 0 auto; padding: 0 24px; }
+    nav { border-bottom: 1px solid var(--line); }
+    nav .wrap { display: flex; align-items: center; justify-content: space-between; height: 64px; }
+    .brand { font-weight: 700; letter-spacing: 0.02em; }
+    nav ul { display: flex; gap: 28px; list-style: none; margin: 0; padding: 0; color: var(--muted); font-size: 15px; }
+    .watermark { display: flex; align-items: center; gap: 14px; font-size: 13px; color: var(--muted); }
+    .watermark label { display: flex; align-items: center; gap: 6px; }
+    /* The ID is readable only on hover or while editing, so a glance at the
+       page, or a screenshot of it, does not give it away. */
+    .watermark input[type=text] {
+        width: 110px; padding: 3px 8px; font: inherit; font-family: ui-monospace, Consolas, monospace;
+        color: var(--ink); background: #f3f3f7; border: 1px solid var(--line); border-radius: 4px;
+        filter: blur(4px); transition: filter 0.15s;
+    }
+    .watermark label:hover input[type=text], .watermark input[type=text]:focus { filter: none; }
+    .watermark .view-link { color: var(--accent); font-weight: 600; }
+    .hero { display: grid; grid-template-columns: 5fr 7fr; gap: 48px; align-items: center; padding: 56px 0 40px; }
+    .hero h1 { font-size: 44px; line-height: 1.15; margin: 0 0 16px; }
+    .hero p { color: var(--muted); font-size: 18px; margin: 0 0 24px; }
+    .hero-image { width: 100%; height: auto; display: block; border-radius: 14px; box-shadow: 0 20px 50px rgba(30, 20, 80, 0.25); }
+    .features { display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px; padding: 32px 0 56px; border-top: 1px solid var(--line); }
+    .features h3 { margin: 0 0 6px; font-size: 17px; }
+    .features p { margin: 0; color: var(--muted); font-size: 15px; }
+    footer { border-top: 1px solid var(--line); color: var(--muted); font-size: 14px; padding: 24px 0 40px; }
+    @media (max-width: 800px) {
+        .hero { grid-template-columns: 1fr; }
+        .features { grid-template-columns: 1fr; }
+        nav ul { display: none; }
+    }
+</style>
+</head>
+<body class="view-site">
+
+<!-- ===================== full-screen view ===================== -->
+<section id="view-full" hidden>
+    <canvas id="frame"></canvas>
+    <div id="panel">
+        <div id="header">
+            <span>Chroma watermark</span>
+            <button id="toggle" title="H also toggles">Hide options</button>
+        </div>
+        <div id="options">
+            <label>Match ID <input id="payload" type="number" min="0" max="4294967295" step="1"></label>
+            <label>Strength <span><input id="strength" type="range" min="0" max="0.20" step="0.005"> <span id="strengthValue"></span></span></label>
+            <label>Enabled <input id="enabled" type="checkbox" checked></label>
+            <button id="download">Download marked PNG</button>
+            <div class="note" id="info"></div>
+            <div class="note">Decode a screenshot with the repository's
+                <code>tools/decode_watermark.py</code>. Press H to hide or show the options.</div>
+            <div class="note"><a href="#" data-view="site">Website view: mark one element of an ordinary page</a></div>
+        </div>
+    </div>
+</section>
+
+<!-- ===================== website view ===================== -->
+<section id="view-site">
+    <nav>
+        <div class="wrap">
+            <a class="brand" href="#">Aurora Studio</a>
+            <ul><li>Work</li><li>Services</li><li>Journal</li><li>Contact</li></ul>
+            <div class="watermark">
+                <label><input id="siteEnabled" type="checkbox" checked> Watermark</label>
+                <label title="Hover to read, click to edit. Any number up to 4294967295; Enter applies.">ID
+                    <input id="sitePayload" type="text" inputmode="numeric" maxlength="10" spellcheck="false" autocomplete="off">
+                </label>
+                <a class="view-link" href="#" data-view="full">Full-screen view</a>
+            </div>
+        </div>
+    </nav>
+    <main class="wrap">
+        <section class="hero">
+            <div>
+                <h1>Light, captured and composed.</h1>
+                <p>An ordinary page. Text, navigation and layout are untouched;
+                   only the image on the right carries the mark, embedded in the
+                   browser with the same shader the desktop demo uses.</p>
+            </div>
+            <img class="hero-image" src="assets/hero.png" alt="Lake at dawn" data-watermark>
+        </section>
+        <section class="features">
+            <div><h3>Marked where it matters</h3><p>The mark lives in the pixels of one element. A screenshot of the page carries it; the rest of the page carries nothing.</p></div>
+            <div><h3>Invisible by design</h3><p>A low-frequency blue-yellow shift, weighted by what the image can hide. Nothing changes in the text or the chrome.</p></div>
+            <div><h3>Decoded with a crop</h3><p>Point the decoder at the element's rectangle in the screenshot, or give it a loose box and let it search.</p></div>
+        </section>
+    </main>
+    <footer><div class="wrap">Aurora Studio is a demonstration page for the chroma watermark. Nothing here is a real business.</div></footer>
+</section>
+
+<script src="watermark.js"></script>
+<script>
+"use strict";
+
+// URL parameters, all optional:
+//   view=site|full  which demo to show (default site, the ordinary page)
+//   id=<n>          match ID, default random; shared by both views
+//   strength=<f>    default 0.08
+//   fit=native      full-screen view: canvas at the image's own pixel size
+//   dpr=<f>         override the device pixel ratio
+//   panel=0         full-screen view: no panel at all (for screenshots)
+//   options=0       full-screen view: start with the options collapsed
+const params = new URLSearchParams(location.search);
+const randomId = () => crypto.getRandomValues(new Uint32Array(1))[0];
+let payload = params.has("id") ? (Number(params.get("id")) >>> 0) : randomId();
+let strength = params.has("strength") ? Number(params.get("strength")) : 0.08;
+const fitNative = params.get("fit") === "native";
+const dpr = params.has("dpr") ? Number(params.get("dpr")) : (window.devicePixelRatio || 1);
+
+function fail(message) {
+    document.body.dataset.error = message;
+    console.error(message);
+    const info = document.getElementById("info");
+    if (info)
+        info.textContent = message;
+}
+window.addEventListener("error", (event) => fail(event.message));
+
+// ---- view switching ------------------------------------------------------
+
+const views = { full: document.getElementById("view-full"), site: document.getElementById("view-site") };
+let currentView = params.get("view") === "full" ? "full" : "site";
+
+function showView(name) {
+    currentView = name;
+    for (const [key, element] of Object.entries(views))
+        element.hidden = key !== name;
+    document.body.className = "view-" + name;
+    document.title = name === "site" ? "Aurora Studio" : `Chroma watermark: ID ${payload}`;
+    // The view that just appeared has been laid out for the first time or
+    // has a stale size; give it a frame and let it fit itself.
+    requestAnimationFrame(() => (name === "site" ? refreshSite() : layoutFull()));
+}
+for (const link of document.querySelectorAll("[data-view]")) {
+    link.addEventListener("click", (event) => {
+        event.preventDefault();
+        showView(link.dataset.view);
+    });
+}
+
+// ---- full-screen view ------------------------------------------------------
+
+const canvas = document.getElementById("frame");
+const fullMark = new ChromaWatermark(canvas);
+fullMark.setPayload(payload);
+fullMark.setStrength(strength);
+
+const ui = {
+    payload: document.getElementById("payload"),
+    strength: document.getElementById("strength"),
+    strengthValue: document.getElementById("strengthValue"),
+    enabled: document.getElementById("enabled"),
+    download: document.getElementById("download"),
+    toggle: document.getElementById("toggle"),
+    options: document.getElementById("options"),
+    panel: document.getElementById("panel"),
+    info: document.getElementById("info"),
+};
+ui.payload.value = payload;
+ui.strength.value = strength;
+ui.strengthValue.textContent = strength.toFixed(3);
+if (params.get("panel") === "0")
+    ui.panel.hidden = true;
+
+const backdrop = new Image();
+backdrop.onerror = () => fail("could not load the backdrop image");
+backdrop.src = "assets/background.png";
+
+// One canvas pixel per device pixel: in native mode the canvas is the
+// image's own size; otherwise it covers the viewport.
+function layoutFull() {
+    if (!backdrop.complete || !backdrop.naturalWidth || currentView !== "full")
+        return;
+    let width, height;
+    if (fitNative) {
+        width = backdrop.naturalWidth;
+        height = backdrop.naturalHeight;
+    } else {
+        width = Math.round(window.innerWidth * dpr);
+        height = Math.round(window.innerHeight * dpr);
+    }
+    canvas.style.width = (width / dpr) + "px";
+    canvas.style.height = (height / dpr) + "px";
+    fullMark.resize(width, height);
+    fullMark.render();
+    ui.info.textContent = `${width}x${height} device pixels, device pixel ratio ${dpr}`;
+    document.body.dataset.ready = "1";
+}
+backdrop.onload = () => {
+    fullMark.setSource(backdrop);
+    layoutFull();
+};
+window.addEventListener("resize", layoutFull);
+
+function setOptionsVisible(visible) {
+    ui.options.hidden = !visible;
+    ui.toggle.textContent = visible ? "Hide options" : "Show options";
+}
+ui.toggle.addEventListener("click", () => setOptionsVisible(ui.options.hidden));
+window.addEventListener("keydown", (event) => {
+    const typing = event.target instanceof HTMLInputElement;
+    if (currentView === "full" && (event.key === "h" || event.key === "H")
+        && !typing && !event.ctrlKey && !event.metaKey && !event.altKey)
+        setOptionsVisible(ui.options.hidden);
+});
+if (params.get("options") === "0")
+    setOptionsVisible(false);
+
+ui.payload.addEventListener("change", () => setPayload(Number(ui.payload.value) >>> 0));
+ui.strength.addEventListener("input", () => {
+    strength = Number(ui.strength.value);
+    ui.strengthValue.textContent = strength.toFixed(3);
+    fullMark.setStrength(strength);
+    fullMark.render();
+    if (siteMark) {
+        siteMark.setStrength(strength);
+        siteMark.render();
+    }
+});
+ui.enabled.addEventListener("change", () => {
+    fullMark.setEnabled(ui.enabled.checked);
+    fullMark.render();
+});
+ui.download.addEventListener("click", async () => {
+    fullMark.render();
+    const blob = await fullMark.toBlob();
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `marked_${payload}.png`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+});
+
+// ---- website view -----------------------------------------------------------
+
+const sitePayloadInput = document.getElementById("sitePayload");
+sitePayloadInput.value = payload;
+
+const siteMark = ChromaWatermark.attachToImage(document.querySelector("img[data-watermark]"), {
+    payload,
+    strength,
+    devicePixelRatio: dpr,
+    // Where the marked element sits in the viewport, in device pixels: the
+    // numbers to pass to the decoder as --crop, and what a test reads.
+    onRender(rect, width, height) {
+        document.body.dataset.markRect = [rect.left * dpr, rect.top * dpr, width, height].map(Math.round).join(",");
+        if (currentView === "site")
+            document.body.dataset.ready = "1";
+    },
+});
+function refreshSite() {
+    if (siteMark.refresh)
+        siteMark.refresh();
+}
+
+document.getElementById("siteEnabled").addEventListener("change", (event) => {
+    siteMark.setEnabled(event.target.checked);
+    siteMark.render();
+});
+
+// A typed ID applies on Enter or when the field loses focus. Anything that
+// is not a whole number in 32-bit range is put back to the current ID.
+function applyTypedId() {
+    const text = sitePayloadInput.value.trim();
+    if (/^\d{1,10}$/.test(text) && Number(text) <= 4294967295)
+        setPayload(Number(text) >>> 0);
+    sitePayloadInput.value = payload;
+}
+sitePayloadInput.addEventListener("change", applyTypedId);
+sitePayloadInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+        applyTypedId();
+        sitePayloadInput.blur();
+    }
+});
+
+// ---- shared state -------------------------------------------------------------
+
+// Both views stamp the same ID, whichever control changed it.
+function setPayload(value) {
+    payload = value >>> 0;
+    ui.payload.value = payload;
+    sitePayloadInput.value = payload;
+    fullMark.setPayload(payload);
+    fullMark.render();
+    siteMark.setPayload(payload);
+    siteMark.render();
+    if (currentView === "full")
+        document.title = `Chroma watermark: ID ${payload}`;
+}
+
+showView(currentView);
+</script>
+</body>
+</html>
